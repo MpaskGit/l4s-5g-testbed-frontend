@@ -1,4 +1,4 @@
-"""5G/L4S single-experiment dataset exporter.
+"""5G/L4S exporter driven by an accepted experiment record.
 
 Reads raw InfluxDB samples for device_0 (non-L4S) and device_1 (L4S).
 Writes a 100 ms UTC, last-observation-carried-forward CSV and a separate
@@ -9,8 +9,7 @@ No experiment metadata or controller state is inferred from the database.
 
 Install: pip install influxdb-client python-dotenv
 Configure INFLUXDB_TOKEN in a local .env; never commit the token.
-Run: python dataset_exporter.py --start 2026-07-23T08:00:00Z \\
-    --stop 2026-07-23T09:00:00Z --experiment-id EXP_001
+Run: python dataset_exporter_configured.py --accepted-experiment accepted.json
 """
 from __future__ import annotations
 
@@ -64,23 +63,29 @@ def flux_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
-def read_influx(query_api, org: str, bucket: str, start: datetime, stop: datetime):
+def read_influx(query_api, org: str, bucket: str, start: datetime, stop: datetime, selections):
+    # Build predicates only from the validated device/KPI catalog.
+    predicates = []
+    for measurement, device in DEVICES.items():
+        for kpi in selections.get(device, []):
+            if kpi == "latency":
+                predicate = '((r.metric == "e2e_latency_client" or r.metric == "e2e_latency_server") and r._field == "sequence")'
+            else:
+                fields = [field for (metric, field), output in FIELDS.items()
+                          if output in KPI_FIELDS[kpi]]
+                metric = {"CE": "ce_marks", "goodput": "goodput",
+                          "retransmissions": "retransmissions"}[kpi]
+                predicate = f'(r.metric == {flux_quote(metric)} and (' + ' or '.join(
+                    f'r._field == {flux_quote(field)}' for field in fields) + '))'
+            predicates.append(f'(r._measurement == {flux_quote(measurement)} and {predicate})')
+    filter_expression = " or\n      ".join(predicates)
     # Extract uint(_time) inside Flux: Python datetime would discard nanoseconds.
     query = f'''
 from(bucket: {flux_quote(bucket)})
   |> range(start: time(v: {flux_quote(start.isoformat())}),
             stop: time(v: {flux_quote(stop.isoformat())}))
-  |> filter(fn: (r) => r._measurement == "device_0_metrics" or
-                        r._measurement == "device_1_metrics")
   |> filter(fn: (r) =>
-      (r.metric == "ce_marks" and
-       (r._field == "ce_packets" or r._field == "ce_percent" or r._field == "total_packets")) or
-      (r.metric == "goodput" and r._field == "goodput_mbps") or
-      (r.metric == "retransmissions" and
-       (r._field == "retransmissions_per_sec" or r._field == "percent_retransmitted" or
-        r._field == "retransmitted_bytes" or r._field == "total_bytes_sent")) or
-      ((r.metric == "e2e_latency_client" or r.metric == "e2e_latency_server") and
-       r._field == "sequence"))
+      {filter_expression})
   |> map(fn: (r) => ({{ r with observation_epoch_ns: string(v: uint(v: r._time)) }}))
   |> keep(columns: ["_measurement", "metric", "_field", "_value", "observation_epoch_ns"])
 '''
@@ -158,17 +163,52 @@ def collect(records):
     return direct, latency, pairing
 
 
-def required_streams(direct, latency):
+KPI_FIELDS = {
+    "CE": ("ce_packets", "ce_percent", "total_packets"),
+    "goodput": ("goodput_mbps",),
+    "latency": ("e2e_latency_ms",),
+    "retransmissions": ("retransmissions_per_sec", "percent_retransmitted",
+                        "retransmitted_bytes", "total_bytes_sent", "retransmitted_kB"),
+}
+
+
+def load_experiment(path):
+    """Read a normalized, server-confirmed record; no browser state or ID guesses."""
+    config = json.loads(path.read_text(encoding="utf-8"))
+    required = ("experiment_id", "start_utc", "stop_utc", "devices")
+    for name in required:
+        if name not in config:
+            raise ValueError(f"Accepted experiment record missing {name}")
+    start, stop = parse_time(config["start_utc"]), parse_time(config["stop_utc"])
+    if start >= stop or not isinstance(config["experiment_id"], str) or not config["experiment_id"]:
+        raise ValueError("Invalid accepted experiment ID or time boundaries")
+    devices = config["devices"]
+    if not isinstance(devices, dict) or not devices:
+        raise ValueError("Provide at least one device with its selected KPIs")
+    selections = {}
+    for measurement, chosen in devices.items():
+        if measurement not in DEVICES:
+            raise ValueError(f"Unknown Influx device measurement: {measurement}")
+        if not isinstance(chosen, list) or not chosen or len(chosen) != len(set(chosen)):
+            raise ValueError(f"Invalid KPI list for {measurement}")
+        unknown = set(chosen) - KPI_FIELDS.keys()
+        if unknown:
+            raise ValueError(f"Unknown KPIs for {measurement}: {sorted(unknown)}")
+        selections[DEVICES[measurement]] = chosen
+    return config, start, stop, selections
+
+
+def selected_groups(direct, latency, selections):
     groups = {}
-    for device in DEVICES.values():
-        for field in FIELDS.values():
-            points = direct.get((device, field), [])
-            if not points:
-                raise RuntimeError(f"Missing required source stream: {device}/{field}")
-            groups[(device, field)] = points
-        if not latency[device]:
-            raise RuntimeError(f"No unambiguous E2E latency pairs: {device}")
-        groups[(device, "e2e_latency_ms")] = latency[device]
+    for device, kpis in selections.items():
+        for kpi in kpis:
+            for field in KPI_FIELDS[kpi]:
+                if field == "retransmitted_kB":
+                    continue  # Derived from retransmitted_bytes when writing CSV.
+                points = latency[device] if field == "e2e_latency_ms" else direct.get((device, field), [])
+                if not points:
+                    raise RuntimeError(f"Selected KPI source missing: {device}/{kpi}/{field}")
+                groups[(device, field)] = points
     return groups
 
 
@@ -190,7 +230,7 @@ def csv_value(value):
     return str(value)
 
 
-def make_rows(groups, experiment_id):
+def make_rows(groups, experiment_id, selections):
     start = max(points[0]["ns"] for points in groups.values())
     stop = min(points[-1]["ns"] for points in groups.values())
     first_grid = ((start + STEP_NS - 1) // STEP_NS) * STEP_NS
@@ -198,7 +238,8 @@ def make_rows(groups, experiment_id):
         raise RuntimeError("Required streams have no common 100 ms interval")
     timeline = range(first_grid, stop + 1, STEP_NS)
     columns = [f"{device}_{field}" for device in DEVICES.values()
-               for field in [*FIELDS.values(), "retransmitted_kB", "e2e_latency_ms"]]
+               for field in [field for kpi in selections.get(device, [])
+                             for field in KPI_FIELDS[kpi]]] 
     rows = [{"timestamp": iso_ns(ns), "experiment_id": experiment_id} for ns in timeline]
     for (device, field), points in groups.items():
         column = f"{device}_{field}"
@@ -239,41 +280,42 @@ def numeric_sum(points):
     return sum((Decimal(str(p["value"])) for p in points), Decimal(0))
 
 
-def summary_for_device(device, direct, latency, pairing):
+def summary_for_device(device, chosen, direct, latency, pairing):
+    """Whole-range statistics only for selected KPI families."""
+    result = {"selected_kpis": chosen}
     get = lambda field: direct[(device, field)]
-    ce = numeric_sum(get("ce_packets"))
-    packets = numeric_sum(get("total_packets"))
-    retrans_bytes = numeric_sum(get("retransmitted_bytes"))
-    sent = numeric_sum(get("total_bytes_sent"))
-    retrans_rate_sum = numeric_sum(get("retransmissions_per_sec"))
-    retrans_values = [Decimal(str(p["value"])) for p in get("retransmissions_per_sec")]
-    latency_values = [p["value"] for p in latency[device]]
-    return {
-        "pairing": pairing[device],
-        "native_sampling_interval_seconds": {
-            field: native_interval_seconds(get(field)) for field in FIELDS.values()
-        } | {"e2e_latency_ms": native_interval_seconds(latency[device])},
-        "overall_ce": {
-            "total_packets_sum_of_samples": packets,
+    if "latency" in chosen:
+        result["pairing"] = pairing[device]
+        values = [p["value"] for p in latency[device]]
+        result["e2e_latency_ms_percentiles_raw_pairs"] = {
+            "p95": exact_selector(values, Decimal("0.95")),
+            "p99": exact_selector(values, Decimal("0.99")),
+        }
+    if "CE" in chosen:
+        ce, total = numeric_sum(get("ce_packets")), numeric_sum(get("total_packets"))
+        result["overall_ce"] = {
+            "total_packets_sum_of_samples": total,
             "total_ce_packets_sum_of_samples": ce,
-            "total_ce_percent_ratio_of_sums": ce / packets * 100 if packets > 0 else Decimal(0),
-        },
-        "overall_retransmissions": {
+            "total_ce_percent_ratio_of_sums": ce / total * 100 if total > 0 else Decimal(0),
+        }
+    if "retransmissions" in chosen:
+        retrans, sent = numeric_sum(get("retransmitted_bytes")), numeric_sum(get("total_bytes_sent"))
+        values = [Decimal(str(p["value"])) for p in get("retransmissions_per_sec")]
+        result["overall_retransmissions"] = {
             "total_bytes_sent_sum_of_samples": sent,
-            "total_retransmitted_bytes_sum_of_samples": retrans_bytes,
-            "total_retransmissions_per_sec_sum_of_samples": retrans_rate_sum,
-            "retransmitted_bytes_percent_ratio_of_sums":
-                retrans_bytes / sent * 100 if sent > 0 else Decimal(0),
-        },
-        "retransmissions_per_sec_percentiles_raw_samples": {
-            "p95": exact_selector(retrans_values, Decimal("0.95")),
-            "p99": exact_selector(retrans_values, Decimal("0.99")),
-        },
-        "e2e_latency_ms_percentiles_raw_pairs": {
-            "p95": exact_selector(latency_values, Decimal("0.95")),
-            "p99": exact_selector(latency_values, Decimal("0.99")),
-        },
+            "total_retransmitted_bytes_sum_of_samples": retrans,
+            "total_retransmissions_per_sec_sum_of_samples": numeric_sum(get("retransmissions_per_sec")),
+            "retransmitted_bytes_percent_ratio_of_sums": retrans / sent * 100 if sent > 0 else Decimal(0),
+        }
+        result["retransmissions_per_sec_percentiles_raw_samples"] = {
+            "p95": exact_selector(values, Decimal("0.95")),
+            "p99": exact_selector(values, Decimal("0.99")),
+        }
+    result["native_sampling_interval_seconds"] = {
+        field: native_interval_seconds(latency[device] if field == "e2e_latency_ms" else get(field))
+        for kpi in chosen for field in KPI_FIELDS[kpi] if field != "retransmitted_kB"
     }
+    return result
 
 
 def write_outputs(rows, columns, summary, csv_path):
@@ -299,59 +341,57 @@ def write_outputs(rows, columns, summary, csv_path):
     return summary_path
 
 
-def export(records, experiment_id, bucket, start, stop, output):
+def export_configured(records, config, start, stop, selections, output, bucket):
     if not records:
-        raise RuntimeError("No matching InfluxDB records")
-    direct, latency, pairing = collect(records)
-    groups = required_streams(direct, latency)
-    rows, columns, grid_start, grid_stop = make_rows(groups, experiment_id)
+        raise RuntimeError("No matching InfluxDB records for accepted experiment")
+    expected_devices = set(selections)
+    # Collect only chosen streams. An unselected latency stream must not impose
+    # packet parsing or completeness requirements on this experiment.
+    allowed = {(device, field) for device, kpis in selections.items()
+               for kpi in kpis for field in KPI_FIELDS[kpi]}
+    filtered = [r for r in records if r["device"] in expected_devices and (
+        (r["metric"], r["field"]) in FIELDS and
+        (r["device"], FIELDS[(r["metric"], r["field"])]) in allowed or
+        "latency" in selections[r["device"]] and
+        r["metric"] in LATENCY_SIDES and r["field"] == "sequence")]
+    direct, latency, pairing = collect(filtered)
+    groups = selected_groups(direct, latency, selections)
+    rows, columns, grid_start, grid_stop = make_rows(groups, config["experiment_id"], selections)
     summary = {
-        "experiment_id": experiment_id, "bucket": bucket,
+        "experiment_id": config["experiment_id"], "bucket": bucket,
         "query_start_utc": start.isoformat(), "query_stop_utc_exclusive": stop.isoformat(),
         "dataset_start_utc": iso_ns(grid_start), "dataset_end_utc": iso_ns(grid_stop),
-        "common_interval_seconds": STEP_NS / 1e9, "alignment": "LOCF; no future samples",
+        "alignment": "100 ms LOCF within accepted experiment range; no future samples",
+        "selected_devices": list(selections), "selected_kpis": selections,
         "csv_delimiter": ";", "csv_decimal_separator": ",",
-        "latency": {
-            "formula": "(client_epoch_ns - server_epoch_ns) / 1000000",
-            "unit": "ms", "matching": "unique raw sequence per device across selected range",
-            "grafana_window_reproduced": False,
-        },
-        "statistics_note": "Retransmitted KiB in CSV is raw retransmitted bytes / 1024. "
-            "Sums use raw source samples across the query range. "
-            "Percentiles select raw samples/pairs, so Grafana's dynamic-window "
-            "E2E percentiles can differ. The retransmissions_per_sec sum follows "
-            "the provided panel query and is not a physical packet count.",
-        "devices": {device: summary_for_device(device, direct, latency, pairing)
-                    for device in DEVICES.values()},
+        "latency_method": "unique raw sequence pairs per selected device; client-server ns / 1000000; no Grafana dynamic window",
+        "statistics_note": "Statistics use raw selected source samples; Grafana dynamic-window results may differ.",
+        "devices": {device: summary_for_device(device, kpis, direct, latency, pairing)
+                    for device, kpis in selections.items()},
     }
     summary_path = write_outputs(rows, columns, summary, output)
-    print(f"PASS: {len(rows)} rows; {len(columns)-2} KPI columns; "
-          f"{len(rows)*(len(columns)-2)} cells validated")
+    print(f"PASS: {len(rows)} rows, {len(columns)-2} selected KPI columns")
     print(f"CSV: {output}\nSummary: {summary_path}")
     return rows, summary
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", default=DEFAULT_START, help="Inclusive ISO-8601 time with zone")
-    parser.add_argument("--stop", default=DEFAULT_STOP, help="Exclusive ISO-8601 time with zone")
-    parser.add_argument("--experiment-id", default="EXP_001")
-    parser.add_argument("--output", default=os.getenv("EXPORTER_OUTPUT", "output/dataset.csv"),
-                        type=Path)
+    parser.add_argument("--accepted-experiment", required=True, type=Path,
+                        help="JSON record issued or persisted after orchestrator accepts the experiment")
+    parser.add_argument("--output", type=Path, default=Path("output/dataset.csv"))
     args = parser.parse_args()
-    start, stop = parse_time(args.start), parse_time(args.stop)
-    if start >= stop:
-        parser.error("--start must be earlier than --stop")
+    config, start, stop, selections = load_experiment(args.accepted_experiment)
     load_dotenv()
     token = os.getenv("INFLUXDB_TOKEN")
     if not token:
-        raise RuntimeError("Missing INFLUXDB_TOKEN; set it in your local .env")
+        raise RuntimeError("Missing INFLUXDB_TOKEN in local .env")
     org = os.getenv("INFLUXDB_ORG", "students")
     bucket = os.getenv("INFLUXDB_BUCKET", "l4s_tests")
     with InfluxDBClient(url=os.getenv("INFLUXDB_URL", "http://labserver.sense-campus.gr:8086"),
                         token=token, org=org, timeout=120_000) as client:
-        records = read_influx(client.query_api(), org, bucket, start, stop)
-    export(records, args.experiment_id, bucket, start, stop, args.output.resolve())
+        records = read_influx(client.query_api(), org, bucket, start, stop, selections)
+    export_configured(records, config, start, stop, selections, args.output.resolve(), bucket)
 
 
 if __name__ == "__main__":
